@@ -118,6 +118,12 @@ abc88.cc.cd
 - 放在本仓库的其他文件会在下次同步时被删除。需要保留就加进 `sync-upstream.yml` 的 `PROTECTED_PATHS`（空格分隔）。
 - Secrets 和 Variables（`DNSHE_API_KEY`、`DNSHE_DOMAINS` 等）存在仓库设置里，不在文件树内，同步不会动它们。
 
+### 工作流文件默认不同步
+
+Actions 自带的 `GITHUB_TOKEN` 无法创建或修改 `.github/workflows/` 下的文件，这是平台限制，`permissions` 块和仓库设置都提不了权。没配 `SYNC_TOKEN` 时本工作流会自动跳过该目录，避免整次同步因为推送被拒而失败。
+
+想让工作流也跟着自动同步，建一个细粒度 PAT（`Contents: Read and write` + `Workflows: Read and write`），存成仓库密钥 `SYNC_TOKEN` 即可。
+
 ## 修改执行时间
 
 默认每周一 04:23 UTC。编辑 `.github/workflows/dnshe-auto-renew.yml` 中的 `cron` 字段，并把该文件加进 `sync-upstream.yml` 的 `PROTECTED_PATHS`，否则下次同步会改回默认值。

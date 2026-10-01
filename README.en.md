@@ -118,6 +118,12 @@ Two things to note:
 - Any other file you keep in this repository is deleted on the next sync. Add it to `PROTECTED_PATHS` (space separated) to keep it.
 - Secrets and Variables (`DNSHE_API_KEY`, `DNSHE_DOMAINS`, ...) live in the repository settings, not in the file tree, so the sync never touches them.
 
+### Workflow files are not synced by default
+
+The built-in `GITHUB_TOKEN` cannot create or modify files under `.github/workflows/` — a platform restriction that neither the `permissions` block nor the repository settings can lift. Without `SYNC_TOKEN` the sync skips that directory instead of failing the whole run.
+
+To sync workflows automatically, create a fine-grained PAT (`Contents: Read and write` + `Workflows: Read and write`) and store it as the repository secret `SYNC_TOKEN`.
+
 ## Changing the Schedule
 
 The default is every Monday at 04:23 UTC. Edit the `cron` field in `.github/workflows/dnshe-auto-renew.yml`, and add that file to `PROTECTED_PATHS` in `sync-upstream.yml`, otherwise the next sync reverts it.

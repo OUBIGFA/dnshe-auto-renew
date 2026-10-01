@@ -19,7 +19,6 @@ env:
   # Secrets 和 Variables（DNSHE_API_KEY、DNSHE_DOMAINS 等）存在 GitHub
   # 仓库设置里，不在文件树内，本工作流碰不到它们。
   PROTECTED_PATHS: state/domains-state.json
-
 # 与续期工作流共用同一个组：两者都往 main 推送，串行执行避免 non-fast-forward。
 # 注意：另一个工作流必须使用相同的 group 名才生效。
 concurrency:
@@ -35,6 +34,13 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          # 默认的 GITHUB_TOKEN 无法创建或修改 .github/workflows/ 下的文件，
+          # 这是平台级限制：permissions 块里没有 workflows 这一项，仓库设置里的
+          # "Read and write permissions" 也无效。想在同步里带上工作流，需要配一个
+          # 细粒度 PAT（Contents: Read/write + Workflows: Read/write）并保存为
+          # SYNC_TOKEN 密钥。注意 PAT 必须给 checkout，只给 push 步骤传是无效的
+          # —— checkout 已经把凭据写进 git config 了。没配则回退默认 token。
+          token: ${{ secrets.SYNC_TOKEN || secrets.GITHUB_TOKEN }}
 
       - name: Configure git
         run: |
@@ -60,10 +66,22 @@ jobs:
 
       - name: Mirror upstream, then restore protected paths
         if: steps.guard.outputs.skip != 'true'
+        env:
+          # 是否具备写工作流文件的权限（值本身不打印）
+          HAS_SYNC_TOKEN: ${{ secrets.SYNC_TOKEN != '' }}
         run: |
+          # 没有 SYNC_TOKEN 时默认 token 推不动 .github/workflows/，
+          # 直接把该目录并进保护名单：整体降级为"除工作流外全同步"，
+          # 而不是让整个同步因为推送被拒而失败。
+          PROTECT="$PROTECTED_PATHS"
+          if [ "$HAS_SYNC_TOKEN" != "true" ]; then
+            PROTECT="$PROTECT .github/workflows"
+            echo "未配置 SYNC_TOKEN：本次不同步 .github/workflows/，保留本仓库版本。"
+          fi
+
           # 1) 先把保护路径连同相对目录一起存到临时目录
           STASH="$(mktemp -d)"
-          for path in $PROTECTED_PATHS; do
+          for path in $PROTECT; do
             if [ -e "$path" ]; then
               mkdir -p "$STASH/$(dirname "$path")"
               cp -a "$path" "$STASH/$path"
@@ -89,8 +107,11 @@ jobs:
           # 4) 放回保护路径，以本仓库内容为准，并只把它们重新加回索引。
           #    这里刻意不用 git add -A：那会把本仓库的未跟踪文件也提交进来，
           #    而它们下次同步又会被当成"上游没有的文件"删掉。
-          for path in $PROTECTED_PATHS; do
+          for path in $PROTECT; do
             if [ -e "$STASH/$path" ]; then
+              # 必须先删掉目标再拷：目标若是已存在的目录（上游 checkout 会重建它），
+              # cp -a 会把源目录整个塞进去，变成 .github/workflows/workflows 这种层级。
+              rm -rf -- "$path"
               mkdir -p "$(dirname "$path")"
               cp -a "$STASH/$path" "$path"
               git add -A -- "$path"
