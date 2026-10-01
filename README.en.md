@@ -68,7 +68,7 @@ abc88.cc.cd
 
 Open the `Actions` tab and manually run `DNSHE Auto Renew`.
 
-The first run checks the domains and generates `state/domains-state.json`. After that, the workflow runs automatically every week.
+The first run checks the domains. After that, the workflow runs automatically every week.
 
 ## Domain Management
 
@@ -84,19 +84,19 @@ abc88.cc.cd
 
 ### Adding Domains
 
-Simply append new domains to `DNSHE_DOMAINS`. The next workflow run will automatically detect new domains, fetch their `created_at` from the DNSHE API, calculate the initial expiration date (`created_at + 365` days), and save the result to `state/domains-state.json`. No manual registration date or expiration date needed.
+Simply append new domains to `DNSHE_DOMAINS`. The next workflow run detects new domains automatically and reads the expiration date returned by the API. No manual registration date or expiration date needed.
 
 ### Why No Manual Expiration Date
 
-- On first discovery, the initial expiration is calculated as `created_at + 365` days
-- After a successful renewal, the state is updated with the `new_expires_at` from the API response
-- Expiration rolls forward automatically — no need to update dates every year
+- The expiration date is read directly from the API's `expires_at`
+- After a successful renewal the API returns a new `expires_at`, so the date rolls forward automatically
+- Only when the API returns no expiration date does it fall back to `created_at + 365` days and write the state file
 
 ## Renewal Rules
 
 Default behavior:
 
-- Free renewal window: `175` days before expiration
+- The official renewal window opens `180` days before expiration; this tool acts at `175` days
 - Checked once per week
 - Renewal is only requested when a domain enters the renewal window
 
@@ -107,15 +107,27 @@ If you regenerate your DNSHE API credentials, simply update the GitHub Secrets:
 - `DNSHE_API_KEY`
 - `DNSHE_API_SECRET`
 
+## Syncing with Upstream
+
+`.github/workflows/sync-upstream.yml` aligns this repository with the upstream template every Monday: files upstream adds or changes are pulled in, and files upstream deletes are removed here too.
+
+The one exception is `PROTECTED_PATHS`, which by default contains only `state/domains-state.json` — this repository's own record of expiration dates. Overwriting it would cause repeated renewals.
+
+Two things to note:
+
+- Any other file you keep in this repository is deleted on the next sync. Add it to `PROTECTED_PATHS` (space separated) to keep it.
+- Secrets and Variables (`DNSHE_API_KEY`, `DNSHE_DOMAINS`, ...) live in the repository settings, not in the file tree, so the sync never touches them.
+
 ## Changing the Schedule
 
-Edit the `cron` field in `.github/workflows/dnshe-auto-renew.yml`. Currently runs weekly in UTC.
+The default is every Monday at 04:23 UTC. Edit the `cron` field in `.github/workflows/dnshe-auto-renew.yml`, and add that file to `PROTECTED_PATHS` in `sync-upstream.yml`, otherwise the next sync reverts it.
 
 ## File Reference
 
 - `scripts/dnshe_auto_renew.py` — Renewal script
 - `.github/workflows/dnshe-auto-renew.yml` — Weekly GitHub Actions workflow
-- `state/domains-state.json` — Auto-generated state file
+- `.github/workflows/sync-upstream.yml` — Syncs the whole repository from the upstream template every week
+- `state/domains-state.json` — State file holding the last resolved expiration date, used as a fallback when the API returns none
 
 ## Official Links
 

@@ -8,6 +8,24 @@ on:
 permissions:
   contents: write
 
+env:
+  UPSTREAM: OUBIGFA/dnshe-auto-renew
+  # 以本仓库为准、永不被上游覆盖的路径（空格分隔，可自行追加）。
+  #
+  # 只有 state/domains-state.json：它是每个仓库自己的运行状态（域名的到期时间）。
+  # 一旦被上游的空种子覆盖，续期判断就会退回"每次用 created_at 重算"，
+  # 导致同一域名每周重复调用续期接口。
+  #
+  # Secrets 和 Variables（DNSHE_API_KEY、DNSHE_DOMAINS 等）存在 GitHub
+  # 仓库设置里，不在文件树内，本工作流碰不到它们。
+  PROTECTED_PATHS: state/domains-state.json
+
+# 与续期工作流共用同一个组：两者都往 main 推送，串行执行避免 non-fast-forward。
+# 注意：另一个工作流必须使用相同的 group 名才生效。
+concurrency:
+  group: dnshe-main-write
+  cancel-in-progress: false
+
 jobs:
   sync-upstream-template:
     runs-on: ubuntu-latest
@@ -26,7 +44,7 @@ jobs:
       - name: Skip if this IS the upstream repository
         id: guard
         run: |
-          if [ "${{ github.repository }}" = "OUBIGFA/dnshe-auto-renew" ]; then
+          if [ "${{ github.repository }}" = "$UPSTREAM" ]; then
             echo "Running on the upstream repo itself, skip syncing."
             echo "skip=true" >> "$GITHUB_OUTPUT"
           else
@@ -36,23 +54,61 @@ jobs:
       - name: Add upstream remote and fetch
         if: steps.guard.outputs.skip != 'true'
         run: |
-          git remote add upstream https://github.com/OUBIGFA/dnshe-auto-renew.git 2>/dev/null \
-            || git remote set-url upstream https://github.com/OUBIGFA/dnshe-auto-renew.git
+          git remote add upstream "https://github.com/$UPSTREAM.git" 2>/dev/null \
+            || git remote set-url upstream "https://github.com/$UPSTREAM.git"
           git fetch upstream main --depth=1
 
-      - name: Replace local template files with upstream versions
+      - name: Mirror upstream, then restore protected paths
         if: steps.guard.outputs.skip != 'true'
         run: |
-          git rm -rf --ignore-unmatch scripts/
-          git checkout upstream/main -- scripts/ README.md README.en.md
+          # 1) 先把保护路径连同相对目录一起存到临时目录
+          STASH="$(mktemp -d)"
+          for path in $PROTECTED_PATHS; do
+            if [ -e "$path" ]; then
+              mkdir -p "$STASH/$(dirname "$path")"
+              cp -a "$path" "$STASH/$path"
+              # 镜像前先移走，确保上游版本绝不会残留、也不会与本地版本混淆
+              rm -rf -- "$path"
+            fi
+          done
+
+          # 2) 清空受版本控制的内容，再整体取上游主干。
+          #    先清空是为了让"上游删掉的文件"本地也同步删除 —— 只做 checkout
+          #    无法删除本地多余文件，达不到整仓库对齐。
+          #    -f 是必须的：工作区若被上一次运行改过，git rm 默认会拒绝执行。
+          git rm -rfq --ignore-unmatch -- .
+          git checkout upstream/main -- .
+
+          # 3) 兜底：上游内容没取到就中止，避免把"整仓库被删空"的提交推上去。
+          #    （run 步骤默认 bash -e，任何一步非零退出都会直接失败。）
+          if [ ! -f README.md ] || [ ! -d scripts ]; then
+            echo "::error::Upstream checkout incomplete, aborting without commit."
+            exit 1
+          fi
+
+          # 4) 放回保护路径，以本仓库内容为准，并只把它们重新加回索引。
+          #    这里刻意不用 git add -A：那会把本仓库的未跟踪文件也提交进来，
+          #    而它们下次同步又会被当成"上游没有的文件"删掉。
+          for path in $PROTECTED_PATHS; do
+            if [ -e "$STASH/$path" ]; then
+              mkdir -p "$(dirname "$path")"
+              cp -a "$STASH/$path" "$path"
+              git add -A -- "$path"
+            fi
+          done
+
+          echo "--- staged changes ---"
+          git diff --cached --stat
 
       - name: Commit and push if changed
         if: steps.guard.outputs.skip != 'true'
         run: |
-          if [ -z "$(git status --porcelain)" ]; then
+          # 只看已暂存的改动：本仓库未跟踪的文件不应该触发提交。
+          if [ -z "$(git diff --cached --name-only)" ]; then
             echo "Template files already match upstream, nothing to commit."
             exit 0
           fi
-          git add scripts/ README.md README.en.md
-          git commit -m "chore(template): sync upstream from OUBIGFA/dnshe-auto-renew [auto]"
+          git commit -m "chore(template): sync upstream from $UPSTREAM [auto]"
+          # 期间可能有别的提交落到 main（例如续期状态更新），先变基再推。
+          git pull --rebase origin "${{ github.ref_name }}"
           git push

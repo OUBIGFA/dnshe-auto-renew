@@ -68,7 +68,7 @@ abc88.cc.cd
 
 打开 GitHub 的 `Actions`，手动运行 `DNSHE Auto Renew`。
 
-第一次运行会检查域名并生成 `state/domains-state.json`。之后工作流每周自动运行一次。
+第一次运行会检查域名，之后工作流每周自动运行一次。
 
 ## 域名管理
 
@@ -84,19 +84,19 @@ abc88.cc.cd
 
 ### 新增域名
 
-只需把新域名追加到 `DNSHE_DOMAINS`。下一次 workflow 运行时，会自动发现新域名、从 API 读取 `created_at`，自动计算初始到期时间（`created_at + 365` 天），将结果写入 `state/domains-state.json`。不需要手动填注册时间或到期时间。
+只需把新域名追加到 `DNSHE_DOMAINS`。下一次 workflow 运行时自动发现新域名，并读取接口返回的到期时间。不需要手动填注册时间或到期时间。
 
 ### 为什么不用手填到期时间
 
-- 第一次发现域名时，用 `created_at + 365` 天推算初始到期时间
-- 续期成功后，用 API 返回的 `new_expires_at` 更新状态
-- 后续自动滚动计算，不需要每年改日期
+- 到期时间直接读接口返回的 `expires_at`
+- 续期成功后接口会返回新的 `expires_at`，自动向下滚动
+- 接口不返回到期时间时，回退到 `created_at + 365` 天
 
 ## 续期规则
 
 默认规则：
 
-- 免费续期窗口：到期前 `175` 天
+- 官方续期窗口为到期前 `180` 天，本工具提前 `175` 天进入判断
 - 每周检查一次
 - 只有进入窗口后才会请求续期
 
@@ -107,15 +107,27 @@ abc88.cc.cd
 - `DNSHE_API_KEY`
 - `DNSHE_API_SECRET`
 
+## 与上游同步
+
+`.github/workflows/sync-upstream.yml` 每周一自动把本仓库对齐到上游模板：上游新增、修改的文件会同步过来，上游删掉的文件也会跟着删掉。
+
+唯一的例外是 `PROTECTED_PATHS`，默认只含 `state/domains-state.json` —— 它是本仓库自己的到期时间记录，被覆盖会导致重复续期。
+
+两点注意：
+
+- 放在本仓库的其他文件会在下次同步时被删除。需要保留就加进 `sync-upstream.yml` 的 `PROTECTED_PATHS`（空格分隔）。
+- Secrets 和 Variables（`DNSHE_API_KEY`、`DNSHE_DOMAINS` 等）存在仓库设置里，不在文件树内，同步不会动它们。
+
 ## 修改执行时间
 
-编辑 `.github/workflows/dnshe-auto-renew.yml` 中的 `cron` 字段。当前为每周一次，时间使用 UTC。
+默认每周一 04:23 UTC。编辑 `.github/workflows/dnshe-auto-renew.yml` 中的 `cron` 字段，并把该文件加进 `sync-upstream.yml` 的 `PROTECTED_PATHS`，否则下次同步会改回默认值。
 
 ## 文件说明
 
 - `scripts/dnshe_auto_renew.py`：续期脚本
 - `.github/workflows/dnshe-auto-renew.yml`：每周 GitHub Actions 工作流
-- `state/domains-state.json`：运行后自动生成的状态文件
+- `.github/workflows/sync-upstream.yml`：每周从上游模板同步整个仓库
+- `state/domains-state.json`：状态文件，保存最近解析到的到期时间，接口不返回时用它兜底；内容变化才会提交
 
 ## 官方文档
 

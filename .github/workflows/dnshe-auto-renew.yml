@@ -11,8 +11,16 @@ on:
 permissions:
   contents: write
 
+# 与 sync-upstream 共用同一个组：两者都往 main 推送，串行执行避免 non-fast-forward。
+# 注意：sync-upstream.yml 必须使用相同的 group 名才生效。
+concurrency:
+  group: dnshe-main-write
+  cancel-in-progress: false
+
 jobs:
   renew:
+    # 模板仓库自身没有配 secrets/variables，跑起来必定失败，直接跳过。
+    if: github.repository != 'OUBIGFA/dnshe-auto-renew'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -35,7 +43,10 @@ jobs:
 
       - name: Commit updated renewal state
         run: |
-          if git diff --quiet -- state/domains-state.json; then
+          # 这里必须用 git status 而不是 git diff --quiet：
+          # git diff 只比对已跟踪文件，状态文件若未被跟踪就会被静默忽略，
+          # 于是永远打印 "No state changes to commit."，状态不落盘。
+          if [ -z "$(git status --porcelain -- state/domains-state.json)" ]; then
             echo "No state changes to commit."
             exit 0
           fi
@@ -43,4 +54,6 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add state/domains-state.json
           git commit -m "chore: update DNSHE renewal state"
+          # 期间可能有别的提交落到 main（例如 sync-upstream），先变基再推。
+          git pull --rebase origin "${{ github.ref_name }}"
           git push

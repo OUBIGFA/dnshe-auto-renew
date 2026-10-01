@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
+from urllib.parse import urlencode
 
 
 DATE_FORMAT = "%Y-%m-%d %H:%M"
@@ -18,15 +19,29 @@ DATETIME_FORMATS = (
 )
 API_BASE = "https://api005.dnshe.com/index.php?m=domain_hub"
 
+# 显式点名要这些字段：文档说 fields 默认是 all，但同一份文档的返回示例里
+# 并没有 expires_at，所以不能指望默认集合一定带上它。
+# 文档说明自定义 fields 时接口会自动补充 id，两种情况都能覆盖。
+SUBDOMAIN_FIELDS = "id,full_domain,status,created_at,expires_at,never_expires"
+
+# 官方续期窗口在到期前 180 天打开，这里留 5 天余量。
+DEFAULT_RENEW_BEFORE_DAYS = 175
+
 
 @dataclass
 class ManagedDomain:
     domain: str
-    expires_at: datetime
+    # never_expires 的域名没有到期日，此时为 None。
+    expires_at: datetime | None
     renew_before_days: int
+    # 到期时间的取值来源，打进日志便于核对实际走的是哪一级。
+    source: str
+    never_expires: bool = False
 
     @property
-    def renew_at(self) -> datetime:
+    def renew_at(self) -> datetime | None:
+        if self.expires_at is None:
+            return None
         return self.expires_at - timedelta(days=self.renew_before_days)
 
 
@@ -39,8 +54,10 @@ class DNSHEClient:
             "User-Agent": "dnshe-auto-renew/1.0",
         }
 
-    def _request(self, endpoint: str, action: str, method: str = "GET", payload: Dict[str, Any] | None = None) -> Dict[str, Any]:
+    def _request(self, endpoint: str, action: str, method: str = "GET", payload: Dict[str, Any] | None = None, params: Dict[str, str] | None = None) -> Dict[str, Any]:
         url = f"{API_BASE}&endpoint={endpoint}&action={action}"
+        if params:
+            url = f"{url}&{urlencode(params)}"
         data = None if payload is None else json.dumps(payload).encode("utf-8")
         request = urllib.request.Request(url, headers=self.headers, data=data, method=method)
         try:
@@ -53,7 +70,7 @@ class DNSHEClient:
             raise RuntimeError(f"DNSHE network error: {exc}") from exc
 
     def list_subdomains(self) -> List[Dict[str, Any]]:
-        response = self._request("subdomains", "list")
+        response = self._request("subdomains", "list", params={"fields": SUBDOMAIN_FIELDS})
         if not response.get("success"):
             raise RuntimeError(f"DNSHE list failed: {response}")
         return response.get("subdomains", [])
@@ -126,6 +143,33 @@ def derive_initial_expiration(created_at: str) -> datetime:
     return parse_datetime(created_at) + timedelta(days=365)
 
 
+def is_truthy(value: Any) -> bool:
+    """兼容接口用 true / 1 / "1" / "true" 表达布尔值的写法。"""
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes"}
+    return bool(value)
+
+
+def resolve_expiration(matched: Dict[str, Any], stored_item: Dict[str, Any], domain_name: str) -> Tuple[datetime, str]:
+    """按「接口 > 状态文件 > created_at 推算」三级取到期时间。
+
+    接口优先：subdomains/list 本身就会返回 expires_at（官方 V2.0 文档 fields 参数）。
+    后两级只是接口不返回该字段时的兜底，避免退回"每周重算、每周续期"的状态。
+    """
+    api_expires_at = matched.get("expires_at")
+    if api_expires_at:
+        return parse_datetime(api_expires_at), "api:expires_at"
+
+    stored_expires_at = stored_item.get("expires_at")
+    if stored_expires_at:
+        return parse_datetime(stored_expires_at), "state:expires_at"
+
+    created_at = matched.get("created_at")
+    if not created_at:
+        raise RuntimeError(f"DNSHE response missing expires_at and created_at for {domain_name}")
+    return derive_initial_expiration(created_at), "derived:created_at_plus_365_days"
+
+
 def build_managed_domains(domain_names: List[str], subdomain_map: Dict[str, Dict[str, Any]], state: Dict[str, Any]) -> Tuple[List[ManagedDomain], bool]:
     managed: List[ManagedDomain] = []
     state_changed = False
@@ -137,29 +181,43 @@ def build_managed_domains(domain_names: List[str], subdomain_map: Dict[str, Dict
             raise RuntimeError(f"Domain not found in DNSHE account: {domain_name}")
 
         item = stored_domains.get(domain_name, {})
-        expires_at = item.get("expires_at")
-        if expires_at:
-            expires_dt = parse_datetime(expires_at)
-        else:
-            created_at = matched.get("created_at")
-            if not created_at:
-                raise RuntimeError(f"DNSHE response missing created_at for {domain_name}")
-            expires_dt = derive_initial_expiration(created_at)
-            item = {
-                "expires_at": expires_dt.strftime(DATE_FORMAT),
-                "renew_before_days": int(item.get("renew_before_days", 175)),
-                "source": "created_at_plus_365_days",
-            }
-            stored_domains[domain_name] = item
+        renew_before_days = int(item.get("renew_before_days", DEFAULT_RENEW_BEFORE_DAYS))
+
+        # 永久域名不参与续期，也不写状态。
+        if is_truthy(matched.get("never_expires")):
+            managed.append(
+                ManagedDomain(
+                    domain=domain_name,
+                    expires_at=None,
+                    renew_before_days=renew_before_days,
+                    source="api:never_expires",
+                    never_expires=True,
+                )
+            )
+            continue
+
+        expires_dt, source = resolve_expiration(matched, item, domain_name)
+
+        # 把解析结果回写状态：接口是权威来源，但万一它哪天不再返回该字段，
+        # 状态文件里也有一份真实值兜底，而不是回退到 created_at 推算。
+        previous_expires_at = item.get("expires_at")
+        previous_renew_before_days = item.get("renew_before_days")
+        item["expires_at"] = expires_dt.strftime(DATE_FORMAT)
+        item["renew_before_days"] = renew_before_days
+        item["source"] = source
+        stored_domains[domain_name] = item
+
+        # 只比对到期时间与窗口天数：source 是说明性字段，续期响应与接口
+        # 查询写出的取值不同，不该因此多产生一次提交。
+        if item["expires_at"] != previous_expires_at or item["renew_before_days"] != previous_renew_before_days:
             state_changed = True
 
-        renew_before_days = int(item.get("renew_before_days", 175))
-        item["renew_before_days"] = renew_before_days
         managed.append(
             ManagedDomain(
                 domain=domain_name,
                 expires_at=expires_dt,
                 renew_before_days=renew_before_days,
+                source=source,
             )
         )
 
@@ -174,11 +232,14 @@ def build_managed_domains(domain_names: List[str], subdomain_map: Dict[str, Dict
 
 def update_state_expiration(state: Dict[str, Any], domain_name: str, new_expires_at: str) -> bool:
     item = state.setdefault("domains", {}).setdefault(domain_name, {})
-    if item.get("expires_at") == new_expires_at:
+    # 统一成 DATE_FORMAT：续期响应带秒，直接落盘会让下次运行读出接口值时
+    # 因格式差异被判定为"有变化"，白提交一次。
+    canonical = parse_datetime(new_expires_at).strftime(DATE_FORMAT)
+    if item.get("expires_at") == canonical:
         return False
-    item["expires_at"] = new_expires_at
-    item["source"] = "dnshe_renew_response"
-    item["renew_before_days"] = int(item.get("renew_before_days", 175))
+    item["expires_at"] = canonical
+    item["source"] = "api:renew_response"
+    item["renew_before_days"] = int(item.get("renew_before_days", DEFAULT_RENEW_BEFORE_DAYS))
     return True
 
 
@@ -201,12 +262,25 @@ def main() -> int:
     print(f"UTC now: {now.strftime(DATE_FORMAT)}")
     for managed in managed_domains:
         matched = subdomain_map[managed.domain]
+        # 一并打出接口实际返回的字段名：这是判断 expires_at 到底有没有被返回的
+        # 唯一可靠依据，看到这行就不必再额外跑一次调试流程。
+        print(f"[SOURCE] {managed.domain} from={managed.source} api_fields={','.join(matched.keys())}")
+
+        if managed.never_expires:
+            print(f"[SKIP] {managed.domain} is marked never_expires.")
+            continue
+
+        expires_at, renew_at = managed.expires_at, managed.renew_at
+        if expires_at is None or renew_at is None:
+            print(f"[SKIP] {managed.domain} has no known expiration date.")
+            continue
+
         print(
-            f"[CHECK] {managed.domain} expires_at={managed.expires_at.strftime(DATE_FORMAT)} "
-            f"renew_at={managed.renew_at.strftime(DATE_FORMAT)}"
+            f"[CHECK] {managed.domain} expires_at={expires_at.strftime(DATE_FORMAT)} "
+            f"renew_at={renew_at.strftime(DATE_FORMAT)}"
         )
 
-        if now < managed.renew_at:
+        if now < renew_at:
             print(f"[SKIP] {managed.domain} has not entered renewal window yet.")
             continue
 
